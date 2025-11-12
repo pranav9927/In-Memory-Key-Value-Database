@@ -19,16 +19,14 @@ func main() {
 		dir        string
 		dbfilename string
 		port       string
-		replicaOf  string
 	)
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
 	flag.StringVar(&dir, "dir", "~/redisdb", "location of database")
 	flag.StringVar(&dbfilename, "dbfilename", "data.rdb", "name of rdb file")
 	flag.StringVar(&port, "port", "6379", "port number for the server")
-	flag.StringVar(&replicaOf, "replicaof", "", "address of master server")
 	flag.Parse()
 	fmt.Println("Logs from your program will appear here!")
-	db = NewDatabase(dir, dbfilename, port, replicaOf)
+	db = NewDatabase(dir, dbfilename, port)
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

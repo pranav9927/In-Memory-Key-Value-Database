@@ -1,15 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
-	"log"
-	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hdt3213/rdb/encoder"
@@ -17,19 +13,14 @@ import (
 )
 
 type DataBase struct {
-	M                    map[string]DBentry
-	dir                  string
-	dbfilename           string
-	port                 string
-	rdbVersion           int
-	replicationInfo      ReplicationInfo
-	cmdQueue             chan Command
-	acknowledgedReplicas map[*net.Conn]int
-	ackCount             int64
-	replicaMutex         sync.Mutex
-	mu                   sync.RWMutex
-	streamWaiters        map[string][]*StreamWaiter // key -> waiters
-	waiterMutex          sync.RWMutex
+	M             map[string]DBentry
+	dir           string
+	dbfilename    string
+	port          string
+	rdbVersion    int
+	mu            sync.RWMutex
+	streamWaiters map[string][]*StreamWaiter // key -> waiters
+	waiterMutex   sync.RWMutex
 }
 type DataType int
 
@@ -44,7 +35,7 @@ type DBentry struct {
 	val       string
 	list      []string
 	stream    *Stream
-	expiresAt int64
+	ttlMs     int64
 	timestamp int64
 }
 
@@ -85,17 +76,34 @@ func (db *DataBase) Incr(key string) error {
 }
 
 func (db *DataBase) Get(key string) *string {
+	now := time.Now().UnixMilli()
+	// First read under RLock
 	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if entry, ok := db.M[key]; ok {
-		if !entry.IsString() {
-			return nil
+	entry, ok := db.M[key]
+	db.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	// Wrong type
+	if !entry.IsString() {
+		return nil
+	}
+	// Not expired
+	if entry.ttlMs == -1 || entry.timestamp+entry.ttlMs >= now {
+		// Return current value (note: returning address of copy would be wrong; re-fetch under RLock)
+		db.mu.RLock()
+		defer db.mu.RUnlock()
+		if e2, ok2 := db.M[key]; ok2 && e2.IsString() && (e2.ttlMs == -1 || e2.timestamp+e2.ttlMs >= now) {
+			return &e2.val
 		}
-		if entry.expiresAt == -1 || entry.expiresAt+entry.timestamp >= time.Now().UnixMilli() {
-			return &entry.val
-		} else {
+		return nil
+	}
+	// Expired: acquire write lock and delete if still present and expired
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if e3, ok3 := db.M[key]; ok3 {
+		if e3.IsString() && !(e3.ttlMs == -1 || e3.timestamp+e3.ttlMs >= now) {
 			delete(db.M, key)
-			return nil
 		}
 	}
 	return nil
@@ -119,48 +127,21 @@ func (db *DataBase) GetType(key string) *string {
 	return nil
 }
 
-func NewDatabase(dir, dbfilename, port, masterAddr string) *DataBase {
-	var isMaster bool
-	if masterAddr == "" {
-		isMaster = true
-	} else {
-		isMaster = false
-	}
+func NewDatabase(dir, dbfilename, port string) *DataBase {
 	db := &DataBase{
-		M:          make(map[string]DBentry),
-		dir:        dir,
-		dbfilename: dbfilename,
-		port:       port,
-		rdbVersion: 10,
-		replicationInfo: ReplicationInfo{
-			IsMaster:         isMaster,
-			masterReplID:     "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
-			masterReplOffset: 0,
-			masterAddr:       masterAddr,
-			replicas:         []*net.Conn{},
-		},
-		cmdQueue:             make(chan Command),
-		acknowledgedReplicas: make(map[*net.Conn]int),
-		ackCount:             0,
-		replicaMutex:         sync.Mutex{},
-		mu:                   sync.RWMutex{},
-		streamWaiters:        make(map[string][]*StreamWaiter),
-		waiterMutex:          sync.RWMutex{},
+		M:             make(map[string]DBentry),
+		dir:           dir,
+		dbfilename:    dbfilename,
+		port:          port,
+		rdbVersion:    10,
+		mu:            sync.RWMutex{},
+		streamWaiters: make(map[string][]*StreamWaiter),
+		waiterMutex:   sync.RWMutex{},
 	}
 	return db
 }
 
 func (db *DataBase) init() {
-	if !db.replicationInfo.IsMaster {
-		conn, err := handShake(db.replicationInfo.masterAddr, db.port)
-		if err != nil {
-			fmt.Println("Error connecting to master:", err)
-			return
-		}
-		go db.listenToMaster(conn)
-	} else {
-		go db.propagateCommands()
-	}
 	if _, err := os.Stat(db.dir + "/" + db.dbfilename); err == nil {
 		err := db.LoadRDB()
 		if err != nil {
@@ -169,103 +150,7 @@ func (db *DataBase) init() {
 	}
 }
 
-func (db *DataBase) propagateCommands() {
-	for cmd := range db.cmdQueue {
-
-		writeCmd := fmt.Sprintf("*%d\r\n", len(cmd.args)+1)
-		writeCmd += fmt.Sprintf("$%d\r\n%s\r\n", len(cmd.cmd), cmd.cmd)
-		for _, arg := range cmd.args {
-			writeCmd += fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)
-		}
-		if cmd.cmd == "SET" || cmd.cmd == "LPUSH" || cmd.cmd == "RPUSH" || cmd.cmd == "INCR" || cmd.cmd == "LPOP" || cmd.cmd == "RPOP" {
-			atomic.AddInt64(&db.replicationInfo.masterReplOffset, int64(len(writeCmd)))
-		}
-		for _, conn := range db.replicationInfo.replicas {
-			(*conn).Write([]byte(writeCmd))
-			// log.Println("Command propagated to replica:", writeCmd)
-		}
-	}
-
-}
-
-func (db *DataBase) listenToMaster(conn *net.Conn) {
-	(*conn).Read(make([]byte, 1024))
-	r := NewRESPreader(*conn)
-	log.Println("---Listening to master---")
-	for {
-		val, n, err := r.Read()
-		// log.Println("Received command from master:", val)
-		if err != nil {
-			// log.Println("Error reading command from master:", err)
-			continue
-		}
-		cmd, er := parseCmd(val)
-		if er != nil {
-			// log.Println("Error parsing command: ", er)
-			continue
-		}
-		switch strings.ToLower(cmd.cmd) {
-		case "replconf":
-			log.Println("Received REPLCONF GETACK command")
-			if strings.ToLower(cmd.args[0]) == "getack" {
-				r.Write(RespData{Type: Array, Array: []RespData{
-					{Type: BulkString, Str: "REPLCONF"},
-					{Type: BulkString, Str: "ACK"},
-					{Type: BulkString, Str: fmt.Sprintf("%d", db.replicationInfo.ReplOffset)}, // Replace with actual slave port
-				}})
-			}
-
-		case "set":
-			err := handleSetCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "incr":
-			err := handleIncrCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-			//	TODO : add error handling for set and incr
-		case "ping":
-			continue
-		case "rpop":
-			err := handleRPOPCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "rpush":
-			err := handleRPUSHCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "lpush":
-			err := handleLPUSHCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "lpop":
-			err := handleLPUSHCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "xadd":
-			err := handleXAddCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-		case "delete":
-			err := handleDeleteCommandSlave(db, cmd)
-			if err == nil {
-				db.replicationInfo.ReplOffset += n
-			}
-
-		default:
-			log.Println("Received unknown command from master:", cmd.cmd)
-
-		}
-
-	}
-}
+// Replication support removed: no propagateCommands or listenToMaster
 
 func (db *DataBase) Delete(key string) {
 	delete(db.M, key)
@@ -308,7 +193,7 @@ func (db *DataBase) SaveRDB() error {
 	// Only write DB header and entries if there are actual keys
 	validKeys := 0
 	for _, entry := range db.M {
-		if entry.expiresAt == -1 || entry.expiresAt+entry.timestamp >= now {
+		if entry.ttlMs == -1 || entry.ttlMs+entry.timestamp >= now {
 			validKeys++
 		}
 	}
@@ -321,13 +206,13 @@ func (db *DataBase) SaveRDB() error {
 
 		for key, entry := range db.M {
 
-			if entry.expiresAt != -1 && entry.expiresAt+entry.timestamp < now {
+			if entry.ttlMs != -1 && entry.ttlMs+entry.timestamp < now {
 				continue // Skip expired keys
 			}
 			switch entry.dataType {
 			case StringType:
-				if entry.expiresAt != -1 {
-					expiry := entry.timestamp + entry.expiresAt
+				if entry.ttlMs != -1 {
+					expiry := entry.timestamp + entry.ttlMs
 					err = enc.WriteStringObject(key, []byte(entry.val), encoder.WithTTL(uint64(expiry)))
 					if err != nil {
 						return fmt.Errorf("failed to write expiry: %v", err)
@@ -344,8 +229,8 @@ func (db *DataBase) SaveRDB() error {
 					listValues[i] = []byte(val)
 				}
 
-				if entry.expiresAt != -1 {
-					expiry := entry.timestamp + entry.expiresAt
+				if entry.ttlMs != -1 {
+					expiry := entry.timestamp + entry.ttlMs
 					err = enc.WriteListObject(key, listValues, encoder.WithTTL(uint64(expiry)))
 					if err != nil {
 						return fmt.Errorf("failed to write expiry: %v", err)
@@ -369,11 +254,14 @@ func (db *DataBase) SaveRDB() error {
 					entryData += strings.Join(fieldPairs, ",")
 					streamData = append(streamData, []byte(entryData))
 				}
-				if entry.expiresAt != -1 {
-					expiry := entry.timestamp + entry.expiresAt
+				if entry.ttlMs != -1 {
+					expiry := entry.timestamp + entry.ttlMs
 					err = enc.WriteListObject(key, streamData, encoder.WithTTL(uint64(expiry)))
 				} else {
 					err = enc.WriteListObject(key, streamData)
+				}
+				if err != nil {
+					return fmt.Errorf("failed to write stream list: %v", err)
 				}
 
 			}
@@ -390,35 +278,7 @@ func (db *DataBase) SaveRDB() error {
 	return nil
 }
 
-func sendEmptyRDB(conn net.Conn) error {
-	// Create an in-memory buffer to hold the RDB data
-	var rdbBuf bytes.Buffer
-
-	// Create the RDB content in the buffer
-	enc := encoder.NewEncoder(&rdbBuf)
-	if err := enc.WriteHeader(); err != nil {
-		return fmt.Errorf("failed to write header: %v", err)
-	}
-	if err := enc.WriteEnd(); err != nil {
-		return fmt.Errorf("failed to write end marker: %v", err)
-	}
-
-	// Get the RDB content
-	rdbData := rdbBuf.Bytes()
-
-	// Create the complete message with header and contents in a single buffer
-	var message bytes.Buffer
-	message.WriteString(fmt.Sprintf("$%d\r\n", len(rdbData)))
-	message.Write(rdbData)
-
-	// Send the complete message in one write
-	_, err := conn.Write(message.Bytes())
-	if err != nil {
-		fmt.Printf("failed to send RDB data: %v", err)
-		return fmt.Errorf("failed to send RDB data: %v", err)
-	}
-	return nil
-}
+// sendEmptyRDB removed with replication
 
 func (db *DataBase) LoadRDB() error {
 	// Open the RDB file
@@ -448,14 +308,14 @@ func (db *DataBase) LoadRDB() error {
 					dataType:  StringType,
 					val:       string(str.Value),
 					timestamp: time.Now().UnixMilli(),
-					expiresAt: expirationTime.UnixMilli() - time.Now().UnixMilli(),
+					ttlMs:     expirationTime.UnixMilli() - time.Now().UnixMilli(),
 				}
 			} else {
 				db.M[str.Key] = DBentry{
 					dataType:  StringType,
 					val:       string(str.Value),
 					timestamp: time.Now().UnixMilli(),
-					expiresAt: -1,
+					ttlMs:     -1,
 				}
 			}
 
@@ -484,7 +344,7 @@ func (db *DataBase) LoadRDB() error {
 					dataType:  StreamType,
 					stream:    stream,
 					timestamp: time.Now().UnixMilli(),
-					expiresAt: expiresAt,
+					ttlMs:     expiresAt,
 				}
 			} else {
 				// Parse as regular list
@@ -502,7 +362,7 @@ func (db *DataBase) LoadRDB() error {
 					dataType:  ListType,
 					list:      listValues,
 					timestamp: time.Now().UnixMilli(),
-					expiresAt: expiresAt,
+					ttlMs:     expiresAt,
 				}
 			}
 		}
@@ -720,7 +580,7 @@ func (db *DataBase) LPush(key string, values ...string) int {
 			dataType:  ListType,
 			list:      append(values, []string{}...),
 			timestamp: time.Now().UnixMilli(),
-			expiresAt: -1,
+			ttlMs:     -1,
 		}
 		return len(values)
 	}
@@ -748,7 +608,7 @@ func (db *DataBase) RPush(key string, values ...string) int {
 			dataType:  ListType,
 			list:      values,
 			timestamp: time.Now().UnixMilli(),
-			expiresAt: -1,
+			ttlMs:     -1,
 		}
 		return len(values)
 	}
@@ -885,7 +745,7 @@ func (db *DataBase) XAdd(key string, id string, fields map[string]string) (strin
 			dataType:  StreamType,
 			stream:    stream,
 			timestamp: time.Now().UnixMilli(),
-			expiresAt: -1,
+			ttlMs:     -1,
 		}
 		entry = db.M[key]
 	}

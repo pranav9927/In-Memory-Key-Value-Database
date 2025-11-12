@@ -249,28 +249,4 @@ func handleXReadCommand(cmd Command) RespData {
 	return RespData{Type: Array, Array: respArray}
 }
 
-func handleXAddCommandSlave(db *DataBase, cmd Command) error {
-	if len(cmd.args) < 3 || len(cmd.args)%2 == 0 {
-		return fmt.Errorf("ERR wrong number of arguments for 'xadd' command")
-	}
-
-	key := cmd.args[0]
-	id := cmd.args[1]
-
-	// Parse field-value pairs
-	fields := make(map[string]string)
-	for i := 2; i < len(cmd.args); i += 2 {
-		if i+1 >= len(cmd.args) {
-			return fmt.Errorf("ERR wrong number of arguments for 'xadd' command")
-		}
-		fields[cmd.args[i]] = cmd.args[i+1]
-	}
-
-	_, err := db.XAdd(key, id, fields)
-	if err != nil {
-		return err
-	}
-
-	return nil
-
-}
+// replication-specific XADD slave handler removed
